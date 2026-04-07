@@ -1,0 +1,22 @@
+# Local secrets
+.secrets.local
+*.secrets
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# State files (regenerated automatically)
+scripts/state.json
+scripts/last-flush.json
+scripts/flush.log
+
+# Reports
+reports/
+
+# OS
+.DS_Store
+Thumbs.db
