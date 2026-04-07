@@ -77,6 +77,23 @@ def run_compile(slug: str, project_dir: Path, state_dir: Path, dry_run: bool) ->
     return result.returncode
 
 
+def run_hermes(slug: str, project_dir: Path, state_dir: Path, dry_run: bool) -> int:
+    if dry_run:
+        return 0
+    cmd = [UV_BIN, "run", "--quiet", "--directory", str(REPO_ROOT),
+           "python", "scripts/hermes.py"]
+    env = os.environ.copy()
+    env["KARPATHY_PROJECT_DIR"] = str(project_dir)
+    env["KARPATHY_STATE_DIR"] = str(state_dir)
+    env["CLAUDE_INVOKED_BY"] = "daily_flush_all"
+    log_path = state_dir / "hermes.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as logf:
+        logf.write(f"\n=== {datetime.now(timezone.utc).astimezone().isoformat()} hermes slug={slug} ===\n")
+        result = subprocess.run(cmd, env=env, cwd=str(REPO_ROOT), stdout=logf, stderr=subprocess.STDOUT)
+    return result.returncode
+
+
 def run_lint(slug: str, project_dir: Path, state_dir: Path, dry_run: bool) -> int:
     if dry_run:
         return 0
@@ -98,6 +115,8 @@ def main() -> None:
     parser.add_argument("--slug", help="run only this project")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-lint", action="store_true")
+    parser.add_argument("--skip-hermes", action="store_true",
+                        help="skip the Hermes QA gate (default: run after compile)")
     args = parser.parse_args()
 
     reg = load_registry()
@@ -128,6 +147,11 @@ def main() -> None:
         if needs:
             rc = run_compile(rp.slug, rp.project_dir, rp.state_dir, args.dry_run)
             print(f"             compile rc={rc}")
+
+            # Hermes runs after compile only when compile actually ran
+            if not args.skip_hermes:
+                rc = run_hermes(rp.slug, rp.project_dir, rp.state_dir, args.dry_run)
+                print(f"             hermes  rc={rc}")
 
         if not args.skip_lint:
             rc = run_lint(rp.slug, rp.project_dir, rp.state_dir, args.dry_run)
