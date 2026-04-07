@@ -11,9 +11,11 @@ require modifying compile.py's input. Post-compile is purely additive — if
 we delete hermes.py tomorrow, the knowledge base still works exactly like
 the unmodified upstream reference.
 
-Hermes uses a SEPARATE, stricter Claude Agent SDK prompt than compile.py.
-The compiler's job is to write; Hermes's job is to challenge. Two agents
-catching different things — same trick that makes code review work.
+Hermes uses a SEPARATE model family (Gemini via the local `gemini` CLI)
+and a stricter, adversarial prompt. The compiler (Claude) writes; Hermes
+(Gemini) challenges. Cross-model review is stronger than same-family
+review because the two models' hallucination patterns and blind spots
+differ — the same trick that makes code review work, but between species.
 
 Usage (typically called by daily_flush_all.py after compile.py):
 
@@ -32,19 +34,22 @@ Direct invocation:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
-from typing import Optional
 
-# Recursion guard
+# Recursion guard (harmless even though Hermes no longer invokes Claude)
 os.environ.setdefault("CLAUDE_INVOKED_BY", "hermes")
+
+GEMINI_BIN = os.environ.get("GEMINI_BIN", "/usr/local/bin/gemini")
+DEFAULT_MODEL = os.environ.get("HERMES_MODEL", "gemini-2.5-pro")
+GEMINI_TIMEOUT_SEC = int(os.environ.get("HERMES_TIMEOUT", "180"))
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -189,16 +194,8 @@ def gather_sibling_articles(article: Path, max_chars: int = 12_000) -> str:
     return "\n\n".join(parts) if parts else "(no other articles yet)"
 
 
-async def validate_one(article: Path) -> tuple[str, str]:
+def validate_one(article: Path, model: str = DEFAULT_MODEL) -> tuple[str, str]:
     """Run Hermes on a single article. Returns (verdict, reasoning_text)."""
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
-
     article_content = article.read_text(encoding="utf-8")
     rel_path = article.relative_to(KNOWLEDGE_DIR)
     sources = gather_source_logs(article)
@@ -286,26 +283,40 @@ Do NOT use any tools. Do NOT propose edits. Do NOT rewrite the article.
 Your only job is the verdict.
 """
 
-    response = ""
+    # Shell out to Gemini CLI in headless, read-only mode.
+    # --approval-mode plan = read-only (no tool execution), our equivalent
+    # of Claude SDK's allowed_tools=[]. -o text keeps stdout clean for parsing.
     try:
-        async for message in query(
-            prompt=prompt,
-            options=ClaudeAgentOptions(
-                cwd=str(PROJECT_ROOT),
-                allowed_tools=[],
-                max_turns=1,
-            ),
-        ):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        response += block.text
-            elif isinstance(message, ResultMessage):
-                pass
+        result = subprocess.run(
+            [
+                GEMINI_BIN,
+                "-p", prompt,
+                "-m", model,
+                "--approval-mode", "plan",
+                "-o", "text",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GEMINI_TIMEOUT_SEC,
+            cwd=str(PROJECT_ROOT),
+        )
+    except subprocess.TimeoutExpired:
+        logging.error("Hermes timeout on %s after %ds", rel_path, GEMINI_TIMEOUT_SEC)
+        return VERDICT_ERROR, f"gemini timeout after {GEMINI_TIMEOUT_SEC}s"
+    except FileNotFoundError:
+        logging.error("Hermes: gemini binary not found at %s", GEMINI_BIN)
+        return VERDICT_ERROR, f"gemini binary not found at {GEMINI_BIN}"
     except Exception as e:
         import traceback
-        logging.error("Hermes SDK error on %s: %s\n%s", rel_path, e, traceback.format_exc())
+        logging.error("Hermes subprocess error on %s: %s\n%s", rel_path, e, traceback.format_exc())
         return VERDICT_ERROR, f"{type(e).__name__}: {e}"
+
+    if result.returncode != 0:
+        stderr_tail = (result.stderr or "")[-500:]
+        logging.error("Hermes gemini rc=%d on %s: %s", result.returncode, rel_path, stderr_tail)
+        return VERDICT_ERROR, f"gemini rc={result.returncode}: {stderr_tail}"
+
+    response = result.stdout or ""
 
     # Strip leading/trailing whitespace and any markdown code fences
     response = response.strip()
@@ -364,7 +375,7 @@ def append_log_entry(verdict: str, rel_path: str, reason: str) -> None:
         f.write(entry)
 
 
-async def run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace) -> int:
     state = load_state()
     if args.file:
         target = Path(args.file)
@@ -394,7 +405,7 @@ async def run(args: argparse.Namespace) -> int:
             print(f"  · would validate {rel}")
             continue
 
-        verdict, reason = await validate_one(article)
+        verdict, reason = validate_one(article, model=args.model)
         cur_hash = file_hash(article) if article.exists() else "deleted"
 
         if verdict == VERDICT_PASS:
@@ -438,10 +449,12 @@ def main() -> None:
     parser.add_argument("--all", action="store_true", help="re-validate every article")
     parser.add_argument("--file", help="validate one specific file")
     parser.add_argument("--dry-run", action="store_true", help="show plan, no writes")
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help=f"gemini model to use (default: {DEFAULT_MODEL})")
     args = parser.parse_args()
 
     configure_logging()
-    rc = asyncio.run(run(args))
+    rc = run(args)
     sys.exit(rc)
 
 
