@@ -13,6 +13,7 @@ Pure local I/O — no API calls, runs in <1 second.
 """
 
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -26,6 +27,15 @@ if os.environ.get("CLAUDE_INVOKED_BY"):
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from router import resolve  # noqa: E402
+
+STATE_ROOT = Path.home() / ".claude" / "karpathy-memory" / "state"
+STATE_ROOT.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    filename=str(STATE_ROOT / "hooks.log"),
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [session-start] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 MAX_CONTEXT_CHARS = 20_000
 MAX_LOG_LINES = 40
@@ -84,7 +94,12 @@ def main() -> None:
 
     try:
         context = build_context(hook_input)
+        cwd = hook_input.get("cwd") or os.environ.get("CLAUDE_CWD") or os.getcwd()
+        from router import resolve as _resolve
+        rp = _resolve(cwd)
+        logging.info("SessionStart fired slug=%s cwd=%s ctx_len=%d", rp.slug, cwd, len(context))
     except Exception as e:
+        logging.error("SessionStart failed: %s", e)
         context = f"## Karpathy Memory\n\n(hook error: {e})"
 
     print(json.dumps({
