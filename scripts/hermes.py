@@ -263,24 +263,26 @@ source. Your job is to catch those.
 
 ## Your response
 
-Respond with EXACTLY one of these formats. Nothing else.
+Respond with EXACTLY one of two formats. No preamble, no code fences, no
+markdown headers around the verdict word.
 
-If the article passes all checks:
+**If the article passes all checks**, your entire response must be:
 
-```
-PASS
-<one short sentence summarizing why this article is good>
-```
+    PASS
+    One short sentence summarizing why this article is good.
 
-If the article should be quarantined:
+**If the article should be quarantined**, your entire response must be:
 
-```
-QUARANTINE
-<numbered list of which checks failed and the specific evidence>
-```
+    QUARANTINE
+    1. **<check name>.** <specific evidence — quote exact phrases from the article and the source logs>
+    2. **<check name>.** <specific evidence>
+    ...
 
-Do NOT use any tools. Do NOT propose edits. Do NOT rewrite the article.
-Your only job is the verdict.
+Rules for the response:
+- Start with the literal word PASS or QUARANTINE on its own line (no wrapping characters, no markdown)
+- Do NOT echo the placeholder text (no `<check name>`, no angle-bracket templates)
+- Do NOT use any tools, propose edits, or rewrite the article
+- Your only job is the verdict itself
 """
 
     # Shell out to Gemini CLI in headless, read-only mode.

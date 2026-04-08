@@ -4,6 +4,11 @@ Compile daily conversation logs into structured knowledge articles.
 This is the "LLM compiler" - it reads daily logs (source code) and produces
 organized knowledge articles (the executable).
 
+Uses OpenAI's Codex CLI (gpt-5.4 by default) as the writing agent. The
+reviewer in the pipeline is Gemini (see hermes.py), so compile + hermes
+give you true cross-family authorship + review: anything one model family
+blindly asserts gets caught by the other.
+
 Usage:
     uv run python compile.py                    # compile new/changed logs only
     uv run python compile.py --all              # force recompile everything
@@ -14,11 +19,20 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import asyncio
+import os
+import subprocess
 import sys
 from pathlib import Path
 
-from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, now_iso
+from config import (
+    AGENTS_FILE,
+    CONCEPTS_DIR,
+    CONNECTIONS_DIR,
+    DAILY_DIR,
+    KNOWLEDGE_DIR,
+    PROJECT_ROOT,
+    now_iso,
+)
 from utils import (
     file_hash,
     list_raw_files,
@@ -28,23 +42,23 @@ from utils import (
     save_state,
 )
 
-# ── Paths for the LLM to use ──────────────────────────────────────────
+# ── Codex CLI configuration ───────────────────────────────────────────
+CODEX_BIN = os.environ.get("CODEX_BIN", "/usr/local/bin/codex")
+COMPILE_MODEL = os.environ.get("COMPILE_MODEL", "gpt-5.4")
+COMPILE_TIMEOUT_SEC = int(os.environ.get("COMPILE_TIMEOUT", "1800"))  # 30 min per log
+
+# Repo root is still useful for a few legacy imports but no longer passed
+# to the agent as its working directory — the agent runs inside the vault
+# project dir so workspace-write sandboxing permits writes to knowledge/.
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
-async def compile_daily_log(log_path: Path, state: dict) -> float:
-    """Compile a single daily log into knowledge articles.
+def compile_daily_log(log_path: Path, state: dict, model: str = COMPILE_MODEL) -> float:
+    """Compile a single daily log into knowledge articles using Codex CLI.
 
-    Returns the API cost of the compilation.
+    Returns a cost placeholder (always 0.0 — the Codex CLI doesn't expose
+    per-invocation cost via `exec`, and you're on a subscription anyway).
     """
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
-
     log_content = log_path.read_text(encoding="utf-8")
     schema = AGENTS_FILE.read_text(encoding="utf-8")
     wiki_index = read_wiki_index()
@@ -128,27 +142,56 @@ Read the daily log above and compile it into wiki articles following the schema 
 
     cost = 0.0
 
+    # Shell out to Codex CLI in non-interactive mode.
+    #   --cd              run inside the vault project dir so workspace-write
+    #                     permits writes to daily_logs/ and knowledge/
+    #   --sandbox workspace-write
+    #                     let the agent write/edit files, but not run arbitrary
+    #                     shell commands outside the workspace
+    #   --skip-git-repo-check
+    #                     the vault is not a git repo
+    #   --dangerously-bypass-approvals-and-sandbox
+    #                     fully headless, no human approval prompts; acceptable
+    #                     because we already constrain writes via --cd + --sandbox
+    #                     and the compiler's prompt is hard-coded to only touch
+    #                     knowledge/*
+    cmd = [
+        CODEX_BIN, "exec",
+        "--cd", str(PROJECT_ROOT),
+        "--sandbox", "workspace-write",
+        "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-m", model,
+        prompt,
+    ]
     try:
-        async for message in query(
-            prompt=prompt,
-            options=ClaudeAgentOptions(
-                cwd=str(ROOT_DIR),
-                system_prompt={"type": "preset", "preset": "claude_code"},
-                allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
-                permission_mode="acceptEdits",
-                max_turns=30,
-            ),
-        ):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        pass  # compilation output - LLM writes files directly
-            elif isinstance(message, ResultMessage):
-                cost = message.total_cost_usd or 0.0
-                print(f"  Cost: ${cost:.4f}")
-    except Exception as e:
-        print(f"  Error: {e}")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=COMPILE_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  Error: codex timeout after {COMPILE_TIMEOUT_SEC}s")
         return 0.0
+    except FileNotFoundError:
+        print(f"  Error: codex binary not found at {CODEX_BIN}")
+        return 0.0
+    except Exception as e:
+        print(f"  Error: {type(e).__name__}: {e}")
+        return 0.0
+
+    if result.returncode != 0:
+        stderr_tail = (result.stderr or "")[-500:]
+        print(f"  Error: codex rc={result.returncode}: {stderr_tail}")
+        return 0.0
+
+    # Codex `exec` streams progress to stdout; keep the last ~40 lines for
+    # debugging if something goes sideways, but don't flood the console.
+    if result.stdout:
+        tail = "\n".join(result.stdout.splitlines()[-3:])
+        if tail.strip():
+            print(f"  {tail}")
 
     # Update state
     rel_path = log_path.name
@@ -208,15 +251,13 @@ def main():
         return
 
     # Compile each file sequentially
-    total_cost = 0.0
     for i, log_path in enumerate(to_compile, 1):
         print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
-        cost = asyncio.run(compile_daily_log(log_path, state))
-        total_cost += cost
+        compile_daily_log(log_path, state)
         print(f"  Done.")
 
     articles = list_wiki_articles()
-    print(f"\nCompilation complete. Total cost: ${total_cost:.2f}")
+    print(f"\nCompilation complete.")
     print(f"Knowledge base: {len(articles)} articles")
 
 
