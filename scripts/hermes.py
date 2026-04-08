@@ -11,11 +11,17 @@ require modifying compile.py's input. Post-compile is purely additive — if
 we delete hermes.py tomorrow, the knowledge base still works exactly like
 the unmodified upstream reference.
 
-Hermes uses a SEPARATE model family (Gemini via the local `gemini` CLI)
-and a stricter, adversarial prompt. The compiler (Claude) writes; Hermes
-(Gemini) challenges. Cross-model review is stronger than same-family
-review because the two models' hallucination patterns and blind spots
-differ — the same trick that makes code review work, but between species.
+Hermes calls the Google Generative Language API directly (Gemini 2.5
+Flash by default) using a stricter, adversarial prompt. Earlier versions
+shelled out to the local `gemini` CLI, but that added ~50 seconds of
+Node startup + OAuth overhead to every call, which blew past our 180s
+timeout on ~50% of reviews. Direct HTTPS to the API is ~10x faster per
+call and more reliable.
+
+The compiler (Codex) writes; Hermes (Gemini) challenges. Cross-family
+review catches more hallucinations than same-family review because the
+two models' blind spots differ — the same trick that makes code review
+work, but between species.
 
 Usage (typically called by daily_flush_all.py after compile.py):
 
@@ -38,8 +44,9 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -47,12 +54,36 @@ from pathlib import Path
 # Recursion guard (harmless even though Hermes no longer invokes Claude)
 os.environ.setdefault("CLAUDE_INVOKED_BY", "hermes")
 
-GEMINI_BIN = os.environ.get("GEMINI_BIN", "/usr/local/bin/gemini")
-# Default is flash, not pro: flash is ~3-5x faster, has much higher daily
-# free-tier request limits, and is plenty strong for adversarial QA review
-# of Codex-written articles. Override via HERMES_MODEL env var for pro.
+# Default is flash: fast, high daily quota, plenty strong for adversarial
+# QA review of Codex-written articles. Override via HERMES_MODEL env var
+# for pro if you need deeper reasoning on subtle quarantine cases.
 DEFAULT_MODEL = os.environ.get("HERMES_MODEL", "gemini-2.5-flash")
 GEMINI_TIMEOUT_SEC = int(os.environ.get("HERMES_TIMEOUT", "180"))
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
+# Resolve the API key. Priority:
+#   1. GEMINI_API_KEY env var (what the user would set in their shell)
+#   2. ~/.claude/karpathy-memory/state/.env  (chmod 600, local only, for
+#      headless launchd/orchestrator runs that don't inherit a shell env)
+def _load_api_key() -> str | None:
+    key = os.environ.get("GEMINI_API_KEY")
+    if key:
+        return key.strip()
+    env_file = Path.home() / ".claude" / "karpathy-memory" / "state" / ".env"
+    if env_file.exists():
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("GEMINI_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+    return None
+
+
+GEMINI_API_KEY = _load_api_key()
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -288,40 +319,68 @@ Rules for the response:
 - Your only job is the verdict itself
 """
 
-    # Shell out to Gemini CLI in headless, read-only mode.
-    # --approval-mode plan = read-only (no tool execution), our equivalent
-    # of Claude SDK's allowed_tools=[]. -o text keeps stdout clean for parsing.
+    if not GEMINI_API_KEY:
+        logging.error("Hermes: GEMINI_API_KEY not set and no state/.env file found")
+        return VERDICT_ERROR, "GEMINI_API_KEY not set"
+
+    # Call the Gemini API directly via HTTPS. This bypasses the gemini CLI
+    # entirely (which adds ~50s of Node/OAuth startup per call, historically
+    # blowing past our 180s timeout on ~50% of reviews).
+    url = f"{GEMINI_API_BASE}/{model}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "candidateCount": 1,
+            # 2048 tokens is plenty for a PASS/QUARANTINE verdict; keeps
+            # responses snappy and avoids runaway generation.
+            "maxOutputTokens": 2048,
+        },
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
     try:
-        result = subprocess.run(
-            [
-                GEMINI_BIN,
-                "-p", prompt,
-                "-m", model,
-                "--approval-mode", "plan",
-                "-o", "text",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=GEMINI_TIMEOUT_SEC,
-            cwd=str(PROJECT_ROOT),
-        )
-    except subprocess.TimeoutExpired:
+        with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_SEC) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")[:500] if hasattr(e, "read") else str(e)
+        logging.error("Hermes gemini API HTTP %d on %s: %s", e.code, rel_path, err_body)
+        return VERDICT_ERROR, f"gemini API HTTP {e.code}: {err_body}"
+    except urllib.error.URLError as e:
+        logging.error("Hermes gemini network error on %s: %s", rel_path, e.reason)
+        return VERDICT_ERROR, f"gemini network error: {e.reason}"
+    except TimeoutError:
         logging.error("Hermes timeout on %s after %ds", rel_path, GEMINI_TIMEOUT_SEC)
         return VERDICT_ERROR, f"gemini timeout after {GEMINI_TIMEOUT_SEC}s"
-    except FileNotFoundError:
-        logging.error("Hermes: gemini binary not found at %s", GEMINI_BIN)
-        return VERDICT_ERROR, f"gemini binary not found at {GEMINI_BIN}"
     except Exception as e:
         import traceback
-        logging.error("Hermes subprocess error on %s: %s\n%s", rel_path, e, traceback.format_exc())
+        logging.error("Hermes API error on %s: %s\n%s", rel_path, e, traceback.format_exc())
         return VERDICT_ERROR, f"{type(e).__name__}: {e}"
 
-    if result.returncode != 0:
-        stderr_tail = (result.stderr or "")[-500:]
-        logging.error("Hermes gemini rc=%d on %s: %s", result.returncode, rel_path, stderr_tail)
-        return VERDICT_ERROR, f"gemini rc={result.returncode}: {stderr_tail}"
+    # Parse the Gemini API response shape.
+    try:
+        parsed = json.loads(body)
+        candidates = parsed.get("candidates") or []
+        if not candidates:
+            # Gemini may return promptFeedback with no candidates if the
+            # prompt was blocked by safety filters.
+            feedback = parsed.get("promptFeedback", {})
+            logging.warning("Hermes: no candidates for %s (feedback=%s)", rel_path, feedback)
+            return VERDICT_ERROR, f"no candidates (feedback={json.dumps(feedback)[:200]})"
+        parts = candidates[0].get("content", {}).get("parts", [])
+        response = "".join(p.get("text", "") for p in parts)
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        logging.error("Hermes: unparseable response on %s: %s; body=%s", rel_path, e, body[:500])
+        return VERDICT_ERROR, f"unparseable response: {e}"
 
-    response = result.stdout or ""
+    if not response.strip():
+        return VERDICT_ERROR, "empty response from gemini"
 
     # Strip leading/trailing whitespace and any markdown code fences
     response = response.strip()
