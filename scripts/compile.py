@@ -44,7 +44,7 @@ from utils import (
 
 # ── Codex CLI configuration ───────────────────────────────────────────
 CODEX_BIN = os.environ.get("CODEX_BIN", "/usr/local/bin/codex")
-COMPILE_MODEL = os.environ.get("COMPILE_MODEL", "gpt-5.4")
+COMPILE_MODEL = os.environ.get("COMPILE_MODEL", "gpt-5.3-codex")
 COMPILE_TIMEOUT_SEC = int(os.environ.get("COMPILE_TIMEOUT", "1800"))  # 30 min per log
 
 # Repo root is still useful for a few legacy imports but no longer passed

@@ -48,7 +48,10 @@ from pathlib import Path
 os.environ.setdefault("CLAUDE_INVOKED_BY", "hermes")
 
 GEMINI_BIN = os.environ.get("GEMINI_BIN", "/usr/local/bin/gemini")
-DEFAULT_MODEL = os.environ.get("HERMES_MODEL", "gemini-2.5-pro")
+# Default is flash, not pro: flash is ~3-5x faster, has much higher daily
+# free-tier request limits, and is plenty strong for adversarial QA review
+# of Codex-written articles. Override via HERMES_MODEL env var for pro.
+DEFAULT_MODEL = os.environ.get("HERMES_MODEL", "gemini-2.5-flash")
 GEMINI_TIMEOUT_SEC = int(os.environ.get("HERMES_TIMEOUT", "180"))
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

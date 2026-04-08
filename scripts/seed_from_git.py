@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -49,6 +50,55 @@ BOT_AUTHORS = {
     "snyk-bot",
     "pre-commit-ci[bot]",
 }
+
+# Commit subjects matching these patterns are considered trivial and are
+# filtered out when --skip-trivial is on. Patterns are case-insensitive and
+# match anywhere in the subject unless anchored. Tuned for noise reduction
+# without dropping intentional work.
+TRIVIAL_PATTERNS = [
+    re.compile(r"^wip\b", re.IGNORECASE),
+    re.compile(r"\bwip$", re.IGNORECASE),
+    re.compile(r"^fix typo", re.IGNORECASE),
+    re.compile(r"^typo\b", re.IGNORECASE),
+    re.compile(r"^bump\s+version", re.IGNORECASE),
+    re.compile(r"^update\s+(deps|dependencies|lockfile|package.?lock)", re.IGNORECASE),
+    re.compile(r"^upgrade\s+(deps|dependencies)", re.IGNORECASE),
+    re.compile(r"^chore\(deps\)", re.IGNORECASE),
+    re.compile(r"^style:", re.IGNORECASE),
+    re.compile(r"^format:?\s", re.IGNORECASE),
+    re.compile(r"^lint:?\s", re.IGNORECASE),
+    re.compile(r"^prettier\b", re.IGNORECASE),
+    re.compile(r"^whitespace\b", re.IGNORECASE),
+    re.compile(r"^revert", re.IGNORECASE),
+    re.compile(r"^merge\s+branch", re.IGNORECASE),
+    re.compile(r"^\.$"),                       # just "."
+    re.compile(r"^(fix|update|change|edit|tweak|adjust|test)\s*$", re.IGNORECASE),
+]
+
+
+def is_trivial(subject: str) -> bool:
+    """Return True if the commit subject matches any trivial pattern."""
+    subject = subject.strip()
+    return any(p.search(subject) for p in TRIVIAL_PATTERNS)
+
+
+def commit_score(c: "Commit") -> tuple:
+    """Ranking key for picking the most substantive commits within a day.
+
+    Higher = more substantive. Sort descending by this tuple and take top N.
+
+    Signals (in order of importance):
+        1. Has a body (multi-line message → author explained intent)
+        2. Longer body (more explanation)
+        3. Longer subject line (specific vs. generic)
+        4. Touches more files (up to a small cap — huge commits aren't
+           necessarily more important, but single-file touches usually aren't)
+    """
+    has_body = 1 if c.body.strip() else 0
+    body_len = len(c.body)
+    subject_len = len(c.subject)
+    file_signal = min(len(c.files), 10)
+    return (has_body, body_len, subject_len, file_signal)
 
 SEED_HEADER = "## Git history (seeded)"
 SEED_END_MARKER = "<!-- /seed_from_git -->"
@@ -191,7 +241,13 @@ def merge_into_daily_log(path: Path, seed_section: str, date: str) -> str:
     return existing + sep + "\n" + seed_section
 
 
-def seed_project(slug: str, repo_path: Path, dry_run: bool) -> tuple[int, int]:
+def seed_project(
+    slug: str,
+    repo_path: Path,
+    dry_run: bool,
+    max_per_day: int | None = None,
+    skip_trivial: bool = False,
+) -> tuple[int, int]:
     """Returns (commit_count, day_count)."""
     rp = resolve(repo_path)
     # Resolution above will use the registry mapping to find the slug.
@@ -216,7 +272,37 @@ def seed_project(slug: str, repo_path: Path, dry_run: bool) -> tuple[int, int]:
         print(f"  {slug}: no commits found")
         return 0, 0
 
+    raw_count = len(commits)
+
+    # Step 1: optionally filter out trivial commits entirely
+    if skip_trivial:
+        commits = [c for c in commits if not is_trivial(c.subject)]
+        if len(commits) < raw_count:
+            print(f"  {slug}: dropped {raw_count - len(commits)} trivial commit(s)")
+
     by_day = group_by_day(commits)
+
+    # Step 2: optionally cap commits per day, keeping the most substantive
+    if max_per_day is not None and max_per_day > 0:
+        capped = {}
+        dropped_by_cap = 0
+        for date, day_commits in by_day.items():
+            if len(day_commits) <= max_per_day:
+                capped[date] = day_commits
+            else:
+                ranked = sorted(day_commits, key=commit_score, reverse=True)[:max_per_day]
+                # Preserve chronological order within the day for readability
+                kept_shas = {c.sha for c in ranked}
+                capped[date] = [c for c in day_commits if c.sha in kept_shas]
+                dropped_by_cap += len(day_commits) - max_per_day
+        by_day = capped
+        if dropped_by_cap:
+            print(f"  {slug}: dropped {dropped_by_cap} commit(s) by per-day cap "
+                  f"(keeping top {max_per_day}/day)")
+
+    # Recompute the final kept-commit count after filtering + capping
+    kept_count = sum(len(v) for v in by_day.values())
+
     repo_name = repo_path.name
 
     for date in sorted(by_day.keys()):
@@ -233,9 +319,9 @@ def seed_project(slug: str, repo_path: Path, dry_run: bool) -> tuple[int, int]:
         daily_file.write_text(new_contents, encoding="utf-8")
 
     if not dry_run:
-        print(f"  {slug}: seeded {len(commits)} commit(s) across {len(by_day)} day(s) "
+        print(f"  {slug}: seeded {kept_count} commit(s) across {len(by_day)} day(s) "
               f"from {repo_name}")
-    return len(commits), len(by_day)
+    return kept_count, len(by_day)
 
 
 def main() -> None:
@@ -246,6 +332,12 @@ def main() -> None:
                         help="seed every project in the registry")
     parser.add_argument("--dry-run", action="store_true",
                         help="show plan, write nothing")
+    parser.add_argument("--max-per-day", type=int, default=None,
+                        help="cap the number of commits included per day "
+                             "(keeps the top N most substantive by ranking)")
+    parser.add_argument("--skip-trivial", action="store_true",
+                        help="drop commits with trivial subjects (wip, typo, "
+                             "deps bumps, style/lint/format, merge branch, etc)")
     args = parser.parse_args()
 
     if not args.slug and not args.all:
@@ -282,7 +374,11 @@ def main() -> None:
     total_days = 0
     for slug, path in targets:
         print(f"→ {slug}  ({path})")
-        c, d = seed_project(slug, path, args.dry_run)
+        c, d = seed_project(
+            slug, path, args.dry_run,
+            max_per_day=args.max_per_day,
+            skip_trivial=args.skip_trivial,
+        )
         total_commits += c
         total_days += d
 

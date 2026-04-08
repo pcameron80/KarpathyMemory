@@ -26,6 +26,52 @@ from router import load_registry, resolve  # noqa: E402
 
 UV_BIN = os.environ.get("UV_BIN", "/Users/philipcameron/.local/bin/uv")
 
+# Lockfile to prevent concurrent runs. Without this, a manually-started
+# run can race against the scheduled launchd daily job and corrupt state
+# (concurrent compiles against the same state.json, overlapping writes
+# to knowledge/, overlapping Codex sessions burning credits twice).
+LOCK_FILE = Path.home() / ".claude" / "karpathy-memory" / "state" / "daily_flush.lock"
+
+
+def acquire_lock() -> bool:
+    """Acquire an exclusive lock. Returns False if another run is active.
+
+    If the lock file exists but its PID is dead (stale lock from a crash),
+    we reclaim it. Otherwise we refuse to run.
+    """
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if LOCK_FILE.exists():
+        try:
+            old_pid = int(LOCK_FILE.read_text().strip())
+        except (ValueError, OSError):
+            old_pid = None
+        if old_pid is not None:
+            try:
+                os.kill(old_pid, 0)  # signal 0 = "does the process exist?"
+                # Process is alive — another run is in progress
+                print(
+                    f"daily_flush_all: another run is already in progress "
+                    f"(pid {old_pid}). Lockfile: {LOCK_FILE}",
+                    file=sys.stderr,
+                )
+                return False
+            except ProcessLookupError:
+                # Stale lock from a crashed run — take it over
+                print(
+                    f"daily_flush_all: reclaiming stale lock from dead pid {old_pid}",
+                    file=sys.stderr,
+                )
+    LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    return True
+
+
+def release_lock() -> None:
+    try:
+        if LOCK_FILE.exists() and LOCK_FILE.read_text().strip() == str(os.getpid()):
+            LOCK_FILE.unlink()
+    except OSError:
+        pass
+
 
 def needs_compile(project_dir: Path, state_dir: Path) -> tuple[bool, str]:
     """Return (needs_compile, reason)."""
@@ -117,8 +163,21 @@ def main() -> None:
     parser.add_argument("--skip-lint", action="store_true")
     parser.add_argument("--skip-hermes", action="store_true",
                         help="skip the Hermes QA gate (default: run after compile)")
+    parser.add_argument("--force", action="store_true",
+                        help="ignore the lockfile and run anyway (dangerous)")
     args = parser.parse_args()
 
+    if not args.force and not acquire_lock():
+        sys.exit(3)
+
+    try:
+        _run(args)
+    finally:
+        if not args.force:
+            release_lock()
+
+
+def _run(args: argparse.Namespace) -> None:
     reg = load_registry()
     slugs_to_check = [args.slug] if args.slug else [p["slug"] for p in reg["projects"]] + [reg.get("default_slug", "_scratch")]
 
