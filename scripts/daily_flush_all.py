@@ -156,6 +156,67 @@ def run_lint(slug: str, project_dir: Path, state_dir: Path, dry_run: bool) -> in
     return result.returncode
 
 
+def commit_vault_changes(vault_path: Path, compiled_slugs: list[str], skipped_slugs: list[str], dry_run: bool) -> None:
+    """Stage and commit any vault changes produced by the nightly run.
+
+    Non-fatal: logs failures to stdout and returns. Skips if the vault is not
+    a git repo or has no changes. Uses the ambient git identity.
+    """
+    if dry_run:
+        return
+    if not vault_path.exists():
+        print(f"  [commit] vault path does not exist: {vault_path}")
+        return
+
+    try:
+        git_dir = subprocess.run(
+            ["git", "-C", str(vault_path), "rev-parse", "--git-dir"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError) as exc:
+        print(f"  [commit] git unavailable: {exc}")
+        return
+    if git_dir.returncode != 0:
+        print(f"  [commit] vault is not a git repo — skipping commit")
+        return
+
+    status = subprocess.run(
+        ["git", "-C", str(vault_path), "status", "--porcelain"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if status.returncode != 0 or not status.stdout.strip():
+        print(f"  [commit] no vault changes to commit")
+        return
+
+    changed_count = len(status.stdout.strip().splitlines())
+    add = subprocess.run(
+        ["git", "-C", str(vault_path), "add", "-A"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if add.returncode != 0:
+        print(f"  [commit] git add failed: {add.stderr.strip()}")
+        return
+
+    now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+    subject = f"Nightly compile {now[:10]} — {len(compiled_slugs)} compiled, {changed_count} file(s) changed"
+    body_lines = []
+    if compiled_slugs:
+        body_lines.append("Compiled: " + ", ".join(compiled_slugs))
+    if skipped_slugs:
+        body_lines.append("Skipped:  " + ", ".join(skipped_slugs))
+    body_lines.append(f"Timestamp: {now}")
+    message = subject + "\n\n" + "\n".join(body_lines) + "\n"
+
+    commit = subprocess.run(
+        ["git", "-C", str(vault_path), "commit", "-m", message],
+        capture_output=True, text=True, timeout=30,
+    )
+    if commit.returncode != 0:
+        print(f"  [commit] git commit failed: {commit.stderr.strip() or commit.stdout.strip()}")
+        return
+    print(f"  [commit] {subject}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--slug", help="run only this project")
@@ -182,9 +243,14 @@ def _run(args: argparse.Namespace) -> None:
     slugs_to_check = [args.slug] if args.slug else [p["slug"] for p in reg["projects"]] + [reg.get("default_slug", "_scratch")]
 
     print(f"=== daily_flush_all started at {datetime.now(timezone.utc).astimezone().isoformat()} ===")
-    print(f"Vault: {reg['vaults'][reg['default_vault']]}")
+    vault_path_raw = reg["vaults"][reg["default_vault"]]
+    vault_path = Path(vault_path_raw).expanduser().resolve()
+    print(f"Vault: {vault_path}")
     print(f"Projects: {len(slugs_to_check)}")
     print()
+
+    compiled_slugs: list[str] = []
+    skipped_slugs: list[str] = []
 
     for slug in slugs_to_check:
         # Find the project's path to use for resolving
@@ -212,10 +278,16 @@ def _run(args: argparse.Namespace) -> None:
                 rc = run_hermes(rp.slug, rp.project_dir, rp.state_dir, args.dry_run)
                 print(f"             hermes  rc={rc}")
 
+            compiled_slugs.append(rp.slug)
+        else:
+            skipped_slugs.append(rp.slug)
+
         if not args.skip_lint:
             rc = run_lint(rp.slug, rp.project_dir, rp.state_dir, args.dry_run)
             print(f"             lint rc={rc}")
 
+    print()
+    commit_vault_changes(vault_path, compiled_slugs, skipped_slugs, args.dry_run)
     print()
     print(f"=== daily_flush_all finished at {datetime.now(timezone.utc).astimezone().isoformat()} ===")
 
