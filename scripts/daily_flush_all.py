@@ -156,49 +156,81 @@ def run_lint(slug: str, project_dir: Path, state_dir: Path, dry_run: bool) -> in
     return result.returncode
 
 
-def commit_vault_changes(vault_path: Path, compiled_slugs: list[str], skipped_slugs: list[str], dry_run: bool) -> None:
-    """Stage and commit any vault changes produced by the nightly run.
-
-    Non-fatal: logs failures to stdout and returns. Skips if the vault is not
-    a git repo or has no changes. Uses the ambient git identity.
-    """
-    if dry_run:
-        return
-    if not vault_path.exists():
-        print(f"  [commit] vault path does not exist: {vault_path}")
-        return
-
+def _is_git_repo(vault_path: Path) -> bool:
     try:
-        git_dir = subprocess.run(
+        r = subprocess.run(
             ["git", "-C", str(vault_path), "rev-parse", "--git-dir"],
             capture_output=True, text=True, timeout=10,
         )
-    except (subprocess.SubprocessError, FileNotFoundError) as exc:
-        print(f"  [commit] git unavailable: {exc}")
+        return r.returncode == 0
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+
+
+def snapshot_vault_dirty(vault_path: Path) -> set[str]:
+    """Return the set of vault-relative paths that differ from HEAD or are untracked.
+
+    Used to diff before/after the compile loop so the nightly commit stages
+    only files the compile actually produced — not unrelated user edits or
+    session-end flush output that were dirty before the run started.
+    """
+    if not _is_git_repo(vault_path):
+        return set()
+    try:
+        modified = subprocess.run(
+            ["git", "-C", str(vault_path), "diff", "--name-only", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.splitlines()
+        untracked = subprocess.run(
+            ["git", "-C", str(vault_path), "ls-files", "--others", "--exclude-standard"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.splitlines()
+    except subprocess.SubprocessError:
+        return set()
+    return {p for p in (modified + untracked) if p}
+
+
+def commit_vault_changes(
+    vault_path: Path,
+    produced_paths: list[str],
+    compiled_slugs: list[str],
+    skipped_slugs: list[str],
+    dry_run: bool,
+) -> None:
+    """Stage and commit ONLY the files the compile loop produced this run.
+
+    produced_paths is vault-relative; computed from the pre/post dirty-set diff
+    taken around the compile loop. Non-fatal: logs failures and returns. Skips
+    if the vault is not a git repo or produced_paths is empty.
+    """
+    if dry_run:
         return
-    if git_dir.returncode != 0:
-        print(f"  [commit] vault is not a git repo — skipping commit")
+    if not produced_paths:
+        print("  [commit] no compile output to commit")
+        return
+    if not _is_git_repo(vault_path):
+        print("  [commit] vault is not a git repo — skipping commit")
         return
 
-    status = subprocess.run(
-        ["git", "-C", str(vault_path), "status", "--porcelain"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if status.returncode != 0 or not status.stdout.strip():
-        print(f"  [commit] no vault changes to commit")
-        return
-
-    changed_count = len(status.stdout.strip().splitlines())
     add = subprocess.run(
-        ["git", "-C", str(vault_path), "add", "-A"],
-        capture_output=True, text=True, timeout=30,
+        ["git", "-C", str(vault_path), "add", "--"] + produced_paths,
+        capture_output=True, text=True, timeout=60,
     )
     if add.returncode != 0:
         print(f"  [commit] git add failed: {add.stderr.strip()}")
         return
 
+    staged = subprocess.run(
+        ["git", "-C", str(vault_path), "diff", "--cached", "--name-only"],
+        capture_output=True, text=True, timeout=15,
+    )
+    staged_lines = [l for l in staged.stdout.splitlines() if l]
+    if not staged_lines:
+        print("  [commit] compile paths had no diff — skipping commit")
+        return
+
     now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
-    subject = f"Nightly compile {now[:10]} — {len(compiled_slugs)} compiled, {changed_count} file(s) changed"
+    subject = f"Nightly compile {now[:10]} — {len(compiled_slugs)} compiled, {len(staged_lines)} file(s) changed"
     body_lines = []
     if compiled_slugs:
         body_lines.append("Compiled: " + ", ".join(compiled_slugs))
@@ -252,6 +284,11 @@ def _run(args: argparse.Namespace) -> None:
     compiled_slugs: list[str] = []
     skipped_slugs: list[str] = []
 
+    # Snapshot the vault's dirty set before the compile loop so we can diff
+    # afterwards and stage ONLY what the compile produced — not unrelated
+    # user edits or session-end flush output that were already uncommitted.
+    pre_dirty = snapshot_vault_dirty(vault_path)
+
     for slug in slugs_to_check:
         # Find the project's path to use for resolving
         if slug == reg.get("default_slug", "_scratch"):
@@ -287,7 +324,9 @@ def _run(args: argparse.Namespace) -> None:
             print(f"             lint rc={rc}")
 
     print()
-    commit_vault_changes(vault_path, compiled_slugs, skipped_slugs, args.dry_run)
+    post_dirty = snapshot_vault_dirty(vault_path)
+    produced = sorted(post_dirty - pre_dirty)
+    commit_vault_changes(vault_path, produced, compiled_slugs, skipped_slugs, args.dry_run)
     print()
     print(f"=== daily_flush_all finished at {datetime.now(timezone.utc).astimezone().isoformat()} ===")
 
