@@ -212,6 +212,10 @@ def commit_vault_changes(
         print("  [commit] vault is not a git repo — skipping commit")
         return
 
+    # Stage produced paths. Required for untracked files; no-op for already-
+    # tracked files that were modified. This may also re-stage working-tree
+    # content for paths that happened to have earlier partial staging, but
+    # the commit step below is scoped so that does not matter.
     add = subprocess.run(
         ["git", "-C", str(vault_path), "add", "--"] + produced_paths,
         capture_output=True, text=True, timeout=60,
@@ -220,8 +224,11 @@ def commit_vault_changes(
         print(f"  [commit] git add failed: {add.stderr.strip()}")
         return
 
+    # Check that those specific paths actually have something to commit. Use
+    # a path-scoped diff so pre-existing staged changes in OTHER files do not
+    # make this check falsely pass.
     staged = subprocess.run(
-        ["git", "-C", str(vault_path), "diff", "--cached", "--name-only"],
+        ["git", "-C", str(vault_path), "diff", "--cached", "--name-only", "--"] + produced_paths,
         capture_output=True, text=True, timeout=15,
     )
     staged_lines = [l for l in staged.stdout.splitlines() if l]
@@ -239,8 +246,13 @@ def commit_vault_changes(
     body_lines.append(f"Timestamp: {now}")
     message = subject + "\n\n" + "\n".join(body_lines) + "\n"
 
+    # Path-scoped commit. `git commit -- <paths>` commits ONLY those paths
+    # (implicit --only semantics), leaving any pre-existing staged content
+    # in other files untouched in the index. This is the critical safety
+    # property — the nightly commit contains only compile output, never
+    # whatever the user had staged for their own work-in-progress commit.
     commit = subprocess.run(
-        ["git", "-C", str(vault_path), "commit", "-m", message],
+        ["git", "-C", str(vault_path), "commit", "-m", message, "--"] + produced_paths,
         capture_output=True, text=True, timeout=30,
     )
     if commit.returncode != 0:
